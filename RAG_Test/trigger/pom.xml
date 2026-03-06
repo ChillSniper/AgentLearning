@@ -65,7 +65,7 @@
     </dependencies>
 
     <build>
-        <finalName>xfg-dev-tech-trigger</finalName>
+        <finalName>trigger</finalName>
     </build>
 
 </project>
