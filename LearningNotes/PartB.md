@@ -12,7 +12,350 @@
 
 ---
 
-## 二、核心概念详解
+## 二、"后台配置"到底是什么？（重点！）
+
+### 简答：数据库 + 后台管理界面
+
+"后台配置"其实就是：**通过后台管理系统（Web 界面），把 Agent 的各种参数存到数据库里**。
+
+### 完整流程图解
+
+```java
+┌─────────────────────────────────────────────────────────────┐
+│  第一步：运营人员在后台页面配置 Agent                         │
+│  ├─ 打开浏览器访问：http://localhost:8091/admin              │
+│  ├─ 填写配置表单：                                           │
+│  │   ├─ Agent 名称：客服助手                                 │
+│  │   ├─ 选择 AI 模型：GPT-4                                  │
+│  │   ├─ 设置 System Prompt：你是一个客服助手                 │
+│  │   ├─ 启用工具：订单查询、物流查询                         │
+│  │   └─ 启用记忆：最近 200 条消息                            │
+│  └─ 点击"保存"按钮                                           │
+└─────────────────────────────────────────────────────────────┘
+                         ↓ HTTP POST 请求
+┌─────────────────────────────────────────────────────────────┐
+│  第二步：后台 API 接收请求，存入数据库                        │
+│  Controller: AiAdminAgentController.addAiAgent()             │
+│  ├─ 插入 ai_agent 表（Agent 基本信息）                       │
+│  ├─ 插入 ai_client_model_config 表（关联模型）               │
+│  ├─ 插入 ai_client_system_prompt_config 表（关联提示词）      │
+│  ├─ 插入 ai_client_advisor_config 表（关联记忆/RAG）         │
+│  └─ 插入 ai_client_tool_config 表（关联工具）                │
+└─────────────────────────────────────────────────────────────┘
+                         ↓ 数据已保存
+┌─────────────────────────────────────────────────────────────┐
+│  第三步：触发预热（Preheat），动态生成 Bean                   │
+│  调用：GET /api/v1/ai/agent/preheat?aiAgentId=123           │
+│  ├─ 从数据库读取刚才保存的配置                                │
+│  ├─ 创建 BeanDefinition                                     │
+│  ├─ 注册到 Spring 容器：ChatClient_123                      │
+│  └─ Agent 就绪，可以使用了                                   │
+└─────────────────────────────────────────────────────────────┘
+                         ↓ 立即可用
+┌─────────────────────────────────────────────────────────────┐
+│  第四步：用户调用 Agent                                       │
+│  调用：GET /api/v1/ai/agent/chat_agent?aiAgentId=123        │
+│  ├─ 从容器获取：ChatClient_123                              │
+│  └─ 调用 AI 返回结果                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 具体的数据库表结构（重中之重！）
+
+#### 1. `ai_agent` 表 - Agent 基本信息
+
+```sql
+CREATE TABLE `ai_agent` (
+  `id` bigint PRIMARY KEY AUTO_INCREMENT COMMENT '智能体ID',
+  `agent_name` varchar(50) COMMENT '智能体名称，如：客服助手',
+  `description` varchar(255) COMMENT '描述，如：处理用户售后问题',
+  `channel` varchar(32) COMMENT '渠道类型：agent/chat_stream',
+  `status` tinyint COMMENT '状态：0禁用，1启用',
+  `create_time` datetime COMMENT '创建时间',
+  `update_time` datetime COMMENT '更新时间'
+) COMMENT='AI智能体配置表';
+
+-- 示例数据
+INSERT INTO `ai_agent` VALUES
+(1, '客服助手', '处理用户订单和物流查询', 'agent', 1, NOW(), NOW()),
+(2, '文案生成助手', '生成营销文案', 'agent', 1, NOW(), NOW());
+```
+
+**这张表存什么？**
+
+- Agent 的名称、描述、状态
+- 相当于定义了"有哪些 Agent"
+
+---
+
+#### 2. `ai_client_model` 表 - AI 模型配置
+
+```sql
+CREATE TABLE `ai_client_model` (
+  `id` bigint PRIMARY KEY AUTO_INCREMENT,
+  `model_name` varchar(50) COMMENT '模型名称，如：GPT-4',
+  `base_url` varchar(255) COMMENT 'API 地址，如：https://api.openai.com',
+  `api_key` varchar(255) COMMENT 'API 密钥',
+  `model_version` varchar(50) COMMENT '模型版本，如：gpt-4-turbo',
+  `timeout` int COMMENT '超时时间（秒）',
+  `status` tinyint COMMENT '状态：0禁用，1启用'
+) COMMENT='AI模型配置表';
+
+-- 示例数据
+INSERT INTO `ai_client_model` VALUES
+(1, 'GPT-4 模型', 'https://api.openai.com', 'sk-xxxxx', 'gpt-4-turbo', 30, 1),
+(2, 'Claude 模型', 'https://api.anthropic.com', 'sk-yyyyy', 'claude-3.5', 30, 1);
+```
+
+**这张表存什么？**
+
+- 连接哪个 AI 服务（OpenAI、Claude、国产大模型）
+- API 地址、密钥、模型版本
+- 相当于定义了"可以调用哪些大模型"
+
+---
+
+#### 3. `ai_client_model_config` 表 - Agent 与模型的关联
+
+```sql
+CREATE TABLE `ai_client_model_config` (
+  `id` bigint PRIMARY KEY AUTO_INCREMENT,
+  `client_id` bigint COMMENT '客户端ID（指向 ai_client）',
+  `model_id` bigint COMMENT '模型ID（指向 ai_client_model）'
+) COMMENT='客户端-模型关联表';
+
+-- 示例数据
+INSERT INTO `ai_client_model_config` VALUES
+(1, 1, 1),  -- 客户端1 使用 GPT-4
+(2, 2, 2);  -- 客户端2 使用 Claude
+```
+
+**这张表存什么？**
+
+- 哪个 Agent/客户端使用哪个模型
+- 相当于定义了"客服助手用 GPT-4，文案助手用 Claude"
+
+---
+
+#### 4. `ai_client_system_prompt` 表 - System Prompt 配置
+
+```sql
+CREATE TABLE `ai_client_system_prompt` (
+  `id` bigint PRIMARY KEY AUTO_INCREMENT,
+  `prompt_name` varchar(50) COMMENT '提示词名称',
+  `prompt_content` text COMMENT '提示词内容',
+  `description` varchar(1024) COMMENT '描述'
+) COMMENT='系统提示词配置表';
+
+-- 示例数据
+INSERT INTO `ai_client_system_prompt` VALUES
+(1, '客服提示词', '你是一个专业的客服助手，负责处理用户的订单和物流问题...', '客服场景'),
+(2, '文案生成提示词', '你是一个营销文案专家，擅长撰写吸引人的广告文案...', '营销场景');
+```
+
+**这张表存什么？**
+
+- 给 AI 设定的角色和规则
+- 相当于告诉 AI"你应该扮演什么角色，遵守什么规则"
+
+---
+
+#### 5. `ai_client_advisor` 表 - 增强器配置（记忆、RAG 等）
+
+```sql
+CREATE TABLE `ai_client_advisor` (
+  `id` bigint PRIMARY KEY AUTO_INCREMENT,
+  `advisor_name` varchar(50) COMMENT '增强器名称',
+  `advisor_type` varchar(50) COMMENT '类型：ChatMemory/RagAnswer/LoggerAdvisor',
+  `order_num` int COMMENT '执行顺序',
+  `ext_param` varchar(2048) COMMENT '扩展参数（JSON格式）',
+  `status` tinyint COMMENT '状态'
+) COMMENT='增强器配置表';
+
+-- 示例数据
+INSERT INTO `ai_client_advisor` VALUES
+(1, '对话记忆', 'ChatMemory', 1, '{"maxMessages": 200}', 1),
+(2, '知识库增强', 'RagAnswer', 2, '{"topK": 5, "filterExpression": "tag==\'客服\'"}', 1);
+```
+
+**这张表存什么？**
+
+- 是否启用对话记忆（记住最近 200 条消息）
+- 是否启用 RAG 知识库检索
+- 相当于给 Agent"装配武器"
+
+---
+
+#### 6. `ai_client_tool_mcp` 表 - 工具配置（MCP Tools）
+
+```sql
+CREATE TABLE `ai_client_tool_mcp` (
+  `id` bigint PRIMARY KEY AUTO_INCREMENT,
+  `tool_name` varchar(50) COMMENT '工具名称，如：订单查询',
+  `command` varchar(255) COMMENT '执行命令，如：node order-query.js',
+  `env` text COMMENT '环境变量（JSON）',
+  `description` varchar(1024) COMMENT '工具描述'
+) COMMENT='MCP工具配置表';
+
+-- 示例数据
+INSERT INTO `ai_client_tool_mcp` VALUES
+(1, '订单查询工具', 'node /app/tools/order-query.js', '{"DB_HOST":"localhost"}', '查询用户订单信息'),
+(2, '物流查询工具', 'node /app/tools/logistics-query.js', '{}', '查询物流状态');
+```
+
+**这张表存什么？**
+
+- Agent 可以调用哪些外部工具
+- 工具的启动命令、环境变量
+- 相当于定义了"Agent 能做什么事情"
+
+---
+
+### 真实的配置案例
+
+假设你要创建一个"智能客服 Agent"，完整的配置流程是：
+
+```java
+第一步：在后台配置 Agent 基本信息
+POST /api/v1/ai/admin/agent/addAiAgent
+{
+  "agentName": "智能客服助手",
+  "description": "处理售后问题",
+  "channel": "agent",
+  "status": 1
+}
+→ 生成 Agent ID = 100
+
+第二步：配置使用的 AI 模型
+POST /api/v1/ai/admin/client/model/addClientModel
+{
+  "modelName": "GPT-4 客服版",
+  "baseUrl": "https://api.openai.com",
+  "apiKey": "sk-xxxxxxx",
+  "modelVersion": "gpt-4-turbo"
+}
+→ 生成 Model ID = 10
+
+第三步：关联 Agent 和模型
+插入 ai_client_model_config 表
+{
+  "clientId": 100,
+  "modelId": 10
+}
+
+第四步：配置 System Prompt
+POST /api/v1/ai/admin/client/prompt/addSystemPrompt
+{
+  "promptName": "客服提示词",
+  "promptContent": "你是专业客服，负责处理订单、退款、物流问题……"
+}
+→ 生成 Prompt ID = 50
+
+第五步：启用对话记忆
+插入 ai_client_advisor_config 表
+{
+  "clientId": 100,
+  "advisorId": 1  // 对话记忆的 Advisor
+}
+
+第六步：配置工具
+插入 ai_client_model_tool_config 表
+{
+  "modelId": 10,
+  "toolType": "mcp",
+  "toolId": 1  // 订单查询工具
+}
+
+第七步：触发预热
+GET /api/v1/ai/agent/preheat?aiAgentId=100
+→ 系统读取上面所有配置
+→ 动态生成 ChatClient_100 Bean
+→ 注入到 Spring 容器
+
+完成！
+现在 Agent #100 已经可以使用了：
+GET /api/v1/ai/agent/chat_agent?aiAgentId=100&message=我的订单在哪里
+```
+
+---
+
+### 为什么叫"动态配置"?
+
+对比传统方式就明白了：
+
+#### 传统硬编码方式
+
+```java
+// 写死在代码里
+@Configuration
+public class AgentConfig {
+
+    @Bean
+    public ChatClient customerServiceAgent() {
+        return ChatClient.builder(chatModel())
+            .defaultSystem("你是客服助手...")
+            .defaultAdvisors(
+                new MessageChatMemoryAdvisor(maxMessages: 200),
+                new QuestionAnswerAdvisor(vectorStore())
+            )
+            .defaultTools(orderQueryTool(), logisticsTool())
+            .build();
+    }
+}
+```
+
+**缺点**：
+
+- 新增一个 Agent → 修改代码 → 重新编译 → 重启服务
+- 运营人员无法自己操作，必须找研发
+
+#### 动态配置方式
+
+```java
+// 从数据库读取配置，动态创建
+public void createAgent(Long agentId) {
+    // 1. 从数据库查询配置
+    AgentConfig config = repository.queryConfig(agentId);
+
+    // 2. 动态构建 Bean
+    ChatClient chatClient = ChatClient.builder(config.getModel())
+        .defaultSystem(config.getPrompt())
+        .defaultAdvisors(config.getAdvisors())
+        .defaultTools(config.getTools())
+        .build();
+
+    // 3. 注册到容器
+    beanFactory.registerSingleton("ChatClient_" + agentId, chatClient);
+}
+```
+
+**优点**：
+
+- 新增 Agent → 后台页面填表 → 立即生效
+- 运营人员自助完成，无需研发介入
+- 无需重启服务
+
+---
+
+### 总结："配置"到底指什么？
+
+| 配置项            | 存储位置                                 | 示例值             |
+| ----------------- | ---------------------------------------- | ------------------ |
+| **Agent 名称**    | `ai_agent.agent_name`                    | "智能客服助手"     |
+| **AI 模型**       | `ai_client_model.model_version`          | "gpt-4-turbo"      |
+| **API 密钥**      | `ai_client_model.api_key`                | "sk-xxxxxxx"       |
+| **System Prompt** | `ai_client_system_prompt.prompt_content` | "你是客服..."      |
+| **对话记忆**      | `ai_client_advisor` + 关联表             | maxMessages: 200   |
+| **知识库**        | `ai_client_advisor` + 关联表             | topK: 5            |
+| **工具**          | `ai_client_tool_mcp` + 关联表            | 订单查询、物流查询 |
+
+所有这些配置项都存在 **MySQL 数据库** 中，通过 **后台管理界面（RESTful API）** 进行增删改查。
+
+---
+
+## 三、核心概念详解
 
 ### 1. 什么是 Bean？
 
